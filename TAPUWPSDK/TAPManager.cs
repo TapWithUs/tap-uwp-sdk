@@ -1,0 +1,346 @@
+﻿using System;
+using System.Collections.Generic;
+using Windows.Devices.Enumeration;
+using Windows.Devices.Bluetooth;
+using System.Diagnostics;
+using Windows.UI.Xaml;
+
+namespace TAPUWPSDK
+{
+
+    
+    public class TappedEventArgs : EventArgs
+    {
+        public string id;
+        public int tapCode;
+    }
+
+    public sealed class TAPManager
+    {
+        private static readonly TAPManager instance = new TAPManager();
+
+        private TAPInputMode defaultInputMode;
+        private TAPInputMode inputModeWhenDeactivated;
+
+        private bool activated;
+
+        System.Threading.Timer __modeTimer;
+
+        private DeviceWatcher deviceWatcher;
+
+        private string property_IsConnected = "System.Devices.Aep.IsConnected";
+        private string property_IsPaired = "System.Devices.Aep.IsPaired";
+        public event Action<string, string, int> OnTapConnected;
+        public event Action<string> OnTapDisconnected;
+        public event Action<string,int>  OnTapped;
+        public event Action<string,int,int, bool> OnMoused;
+
+        private Dictionary<string,TAPDevice> taps;
+        private HashSet<string> pending;
+
+        private bool started;
+        private bool restartWatcher;
+
+        static TAPManager()
+        {
+        }
+
+        private TAPManager()
+        {
+            this.activated = false;
+            this.defaultInputMode = TAPInputMode.Controller_With_MouseHID;
+            this.inputModeWhenDeactivated = TAPInputMode.Text;
+            this.started = false;
+            this.taps = new Dictionary<string,TAPDevice>();
+            this.pending = new HashSet<string>();
+            this.restartWatcher = false;
+        }
+
+        public static TAPManager Instance
+        {
+            get
+            {
+                return instance;
+            }
+        }
+
+        public void Start()
+        {
+            if (!started)
+            {
+                string aqsConnectedFilter = BluetoothLEDevice.GetDeviceSelectorFromConnectionStatus(BluetoothConnectionStatus.Connected);
+                string[] requestedProperties = { "System.Devices.Aep.IsPaired", "System.Devices.Aep.IsConnected", "System.Devices.Aep.DeviceAddress" };
+                deviceWatcher = DeviceInformation.CreateWatcher(aqsConnectedFilter, requestedProperties, DeviceInformationKind.AssociationEndpoint);
+                deviceWatcher.Added += dw_added;
+                deviceWatcher.Removed += dw_removed;
+                deviceWatcher.Stopped += dw_stopped;
+                deviceWatcher.EnumerationCompleted += dw_enum_completed;
+                Window.Current.CoreWindow.Activated += WindowActivated;
+                this.started = true;
+                this.activated = true;
+                this.__modeTimer = new System.Threading.Timer(__ModeTimerTick, null, 0, 9000);
+                this.RestartDeviceWatcher();
+            }
+            
+        }
+
+        private void WindowActivated(object sender, Windows.UI.Core.WindowActivatedEventArgs e)
+        {
+            if (e.WindowActivationState == Windows.UI.Core.CoreWindowActivationState.Deactivated)
+            {
+                TAPManager.Instance.Deactivate();
+            }
+            else
+            {
+                TAPManager.Instance.Activate();
+            }
+        }
+
+        private void SendModeToAllTaps()
+        {
+            foreach (KeyValuePair<string, TAPDevice> kv in this.taps)
+            {
+                
+                if (this.activated)
+                {
+                    kv.Value.sendMode();
+                } else
+                {
+                   kv.Value.sendMode(this.inputModeWhenDeactivated);
+                }
+                
+            }
+        }
+
+        private async void __ModeTimerTick(object state)
+        {
+            if (this.activated)
+            {
+                this.SendModeToAllTaps();
+            }
+        }
+
+        private void ModeTimerTick(object sender, object e)
+        {
+            Debug.WriteLine("Mode timer tick");
+            this.SendModeToAllTaps();
+        }
+  
+        private async void dw_stopped(DeviceWatcher sender, Object o)
+        {
+            TAPManagerLog.Instance.Log(TAPManagerLogEvent.Info, "Device Watcher Stopped.");
+            if (this.restartWatcher)
+            {
+                this.restartWatcher = false;
+                this.deviceWatcher.Start();
+
+            }
+        }
+
+        private async void dw_enum_completed(DeviceWatcher sender, Object o)
+        {
+            TAPManagerLog.Instance.Log(TAPManagerLogEvent.Info, "Device Watcher Enumeration Completed.");
+        }
+
+      
+        private async void dw_removed(DeviceWatcher sender, DeviceInformationUpdate deviceInfoUpdate)
+        {
+            pending.Remove(deviceInfoUpdate.Id);
+            TAPDevice tap;
+            this.taps.TryGetValue(deviceInfoUpdate.Id, out tap);
+            if (tap != null)
+            {
+
+                TAPManagerLog.Instance.Log(TAPManagerLogEvent.Info, "TAP disconnected: " + tap.GetStringDescription());
+                tap.Unready();
+                if (OnTapDisconnected != null)
+                {
+                    OnTapDisconnected(deviceInfoUpdate.Id);
+                }
+
+            }
+        }
+
+        private void RestartDeviceWatcher()
+        {
+            if (started)
+            {
+                this.restartWatcher = true;
+                if (this.deviceWatcher.Status == DeviceWatcherStatus.Created || this.deviceWatcher.Status == DeviceWatcherStatus.Stopped || this.deviceWatcher.Status == DeviceWatcherStatus.Aborted)
+                {
+                    this.restartWatcher = false;
+                    TAPManagerLog.Instance.Log(TAPManagerLogEvent.Info, "Device Watcher Starting");
+                    this.deviceWatcher.Start();
+                    
+                }
+                else if (this.deviceWatcher.Status != DeviceWatcherStatus.Stopping || this.deviceWatcher.Status == DeviceWatcherStatus.EnumerationCompleted)
+                {
+                    this.restartWatcher = true;
+                    TAPManagerLog.Instance.Log(TAPManagerLogEvent.Info, "Device Watcher Stopping");
+                    this.deviceWatcher.Stop();
+                }
+            }
+           
+        }
+
+        public void Activate()
+        {
+            TAPManagerLog.Instance.Log(TAPManagerLogEvent.Info, "TAPManager received WindowActivated event.");
+            this.activated = true;
+            this.SendModeToAllTaps();
+            this.RestartDeviceWatcher();
+        }
+
+        public void Deactivate()
+        {
+            TAPManagerLog.Instance.Log(TAPManagerLogEvent.Info, "TAPManager received WindowDeactivated event. ");
+            this.activated = false;
+            this.SendModeToAllTaps();
+        }
+
+        private void OnTapReady(TAPDevice tap, bool success)
+        {
+            this.pending.Remove(tap.Identifier);
+            if (success)
+            {
+                TAPManagerLog.Instance.Log(TAPManagerLogEvent.Info, "TAP is Ready:" + tap.GetStringDescription());
+                tap.sendMode();
+                tap.OnTapped += this.OnTapTapped;
+                tap.OnMoused += this.OnTapMoused;
+
+                if (this.OnTapConnected != null)
+                {
+                    this.OnTapConnected(tap.Identifier, tap.Name, tap.FW);
+                }
+                     
+            }                         
+            else
+            {
+                TAPManagerLog.Instance.Log(TAPManagerLogEvent.Error, "Couldn't make TAP Ready: " + tap.GetStringDescription());
+                this.taps.Remove(tap.Identifier);
+                
+            }
+       
+        }
+
+        private void OnTapMoused(string identifier, int vx, int vy,  bool isMouse)
+        {
+            if (!this.activated)
+            {
+                return;
+            }
+            Debug.WriteLine("Moused " + vx + ", " + vy);            
+            if (this.OnMoused != null)
+            {
+                this.OnMoused(identifier, vx, vy, isMouse);
+            }
+        }
+
+        private void OnTapTapped(string identifier, int tapCode)
+        {
+            if (!this.activated)
+            {
+                return;
+            }
+            if (this.OnTapped != null)
+            {
+                this.OnTapped(identifier, tapCode);
+            }
+        }
+
+        public int GetPendingCount()
+        {
+            return this.pending.Count;
+        }
+
+        public int GetTapsCount()
+        {
+            return this.taps.Count;
+        }
+
+        private async void dw_added(DeviceWatcher sender, DeviceInformation deviceInfo)
+        {
+            TAPManagerLog.Instance.Log(TAPManagerLogEvent.Info, "Device Watcher added proc.");
+            if ((bool)deviceInfo.Properties[this.property_IsConnected] == true && (bool)deviceInfo.Properties[this.property_IsPaired] == true)
+            {
+
+                if (taps.ContainsKey(deviceInfo.Id) && !pending.Contains(deviceInfo.Id))
+                {
+                    if (taps[deviceInfo.Id].IsConnected)
+                    {
+                        TAPManagerLog.Instance.Log(TAPManagerLogEvent.Info, string.Format("TAP {0} Reconnected. Making it ready...", taps[deviceInfo.Id].GetStringDescription()));
+                        await taps[deviceInfo.Id].Reconnect(this.defaultInputMode);
+                    }
+                    return;
+                }
+
+                TAPManagerLog.Instance.Log(TAPManagerLogEvent.Info, string.Format("Found Connected Device {0}", deviceInfo.Name));
+                if (!taps.ContainsKey(deviceInfo.Id) && !pending.Contains(deviceInfo.Id))
+                {
+                    TAPManagerLog.Instance.Log(TAPManagerLogEvent.Info, string.Format("{0} Is a new device. Checking if it's a TAP", deviceInfo.Name));
+                    pending.Add(deviceInfo.Id);
+                    BluetoothLEDevice device = await BluetoothLEDevice.FromIdAsync(deviceInfo.Id);
+                    TAPDevice t = await TAPDevice.FromBluetoothLEDeviceAsync(device, this.defaultInputMode);
+                    if (t != null)
+                    {
+                        TAPManagerLog.Instance.Log(TAPManagerLogEvent.Info, "Found a connected TAP: " + t.GetStringDescription() + ". Making it ready...");
+                        t.OnTapReady += OnTapReady;
+                        taps.Add(deviceInfo.Id, t);
+                        t.MakeReady();
+
+                    }
+                    else
+                    {
+                        TAPManagerLog.Instance.Log(TAPManagerLogEvent.Info, string.Format("{0} Is Not a TAP", deviceInfo.Name));
+                        pending.Remove(deviceInfo.Id);
+                    }
+                }
+
+            }
+        }
+
+        public void SetTapInputMode(TAPInputMode newInputMode, string identifier = "") 
+        {
+            if (newInputMode == TAPInputMode.Null)
+            {
+                return;
+            }
+            
+            if (identifier != "")
+            {
+                TAPDevice tap;
+                if (this.taps.TryGetValue(identifier, out tap))
+                {
+                    tap.InputMode = newInputMode;
+                    if (this.activated)
+                    {
+                        tap.sendMode();
+                    } else
+                    {
+                        tap.sendMode(this.inputModeWhenDeactivated);
+                    }
+                    
+                }
+            } else
+            {
+                this.defaultInputMode = newInputMode;
+                foreach (KeyValuePair<string, TAPDevice> kv in this.taps)
+                {
+                    TAPDevice tap = kv.Value;
+                    tap.InputMode = newInputMode;
+                    if (this.activated)
+                    {
+                        tap.sendMode();
+                    }
+                    else
+                    {
+                        tap.sendMode(this.inputModeWhenDeactivated);
+                    }
+                }
+            }
+          
+        }
+
+        
+    }
+}
